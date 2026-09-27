@@ -1,675 +1,207 @@
 """
-SafeSense AI inference — ONNX Runtime version (no TensorFlow, no PyTorch).
+SafeSense AI inference layer.
 
-Pipeline:
-  1. keras_model.onnx
-     Teachable Machine classifier with 6 classes.
-     If it is >60% sure the photo is "normal", return "safe".
+Everything in this file is pure model-loading and inference — no Flask, no
+MySQL, no Firebase. app.py imports analyze_damage_with_yolo() from here and
+that's the only thing it needs to know about.
 
-  2. YOLOv8 ONNX models:
-       - flood
-       - hazard
-       - fire_building
+Four models are used, applied in two stages:
 
-     All available models are run and the most confident
-     detection wins.
+  1. keras_model.h5 (a Google Teachable Machine export) — fast 6-class
+     classifier (Earthquake, Smoke, Normal, Landslide, Flood, Fire). Runs
+     first on every image. If it confidently says "normal" (>60%), the
+     pipeline stops there and returns "safe" — this is the common case
+     (most uploaded photos aren't actually hazards) and skipping YOLO for
+     it is a meaningful speed win.
 
-Memory:
-  Free hosts have ~512 MB, so YOLO models are loaded one at
-  a time and released afterward.
+  2. flood_best.pt, hazard_best.pt, hazard_fire_building_best.pt (three
+     separately trained YOLOv8 models) — only run if step 1 didn't
+     confidently clear the image. Each model detects a different class of
+     hazard (see CLASS_INFO below for exactly which). All three run, and
+     whichever single detection (from any of the three, or the Teachable
+     Machine result if it beat all three) has the highest confidence wins.
 
-Set KEEP_MODELS_LOADED=1 if the host has enough RAM.
+See AI_SETUP.md for how to run this, required packages, and deployment
+notes.
 """
 
-import ast
-import gc
-import os
-import sys
 import traceback
 from pathlib import Path
 
-import numpy as np
-import onnxruntime as ort
-from PIL import Image, ImageOps
+MODEL_DIR = Path(__file__).parent / 'ai_model'
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-MODEL_DIR = Path(__file__).parent / "ai_model"
-
-KEEP_LOADED = os.getenv("KEEP_MODELS_LOADED", "0") == "1"
-
-YOLO_CONF = 0.4
-
-YOLO_FILES = {
-    "flood": "flood_best.onnx",
-    "hazard": "hazard_best.onnx",
-    "fire_building": "hazard_fire_building_best.onnx",
-}
-
-TM_FILE = "keras_model.onnx"
-
-
-# ============================================================
-# CLASS INFORMATION
-# ============================================================
-
+# What each detectable class means for the app's UI — which model
+# produces which label is noted alongside it.
 CLASS_INFO = {
-    "flood": {
-        "hazard_level": "danger",
-        "road_status": "Blocked"
-    },
+    # flood_best.pt
+    'flood':               {'hazard_level': 'danger',   'road_status': 'Blocked'},
 
-    "hazard": {
-        "hazard_level": "danger",
-        "road_status": "Structural damage — avoid area"
-    },
+    # hazard_best.pt — trained specifically on earthquake damage
+    'hazard':               {'hazard_level': 'danger',   'road_status': 'Structural damage — avoid area'},
 
-    "fire": {
-        "hazard_level": "danger",
-        "road_status": "Blocked"
-    },
+    # hazard_fire_building_best.pt
+    'fire':                 {'hazard_level': 'danger',   'road_status': 'Blocked'},
+    'collapsed_building':   {'hazard_level': 'danger',   'road_status': 'Blocked'},
 
-    "collapsed_building": {
-        "hazard_level": "danger",
-        "road_status": "Blocked"
-    },
-
-    "earthquake": {
-        "hazard_level": "danger",
-        "road_status": "Structural damage — avoid area"
-    },
-
-    "smoke": {
-        "hazard_level": "moderate",
-        "road_status": "Reduced visibility — proceed with caution"
-    },
-
-    "landslide": {
-        "hazard_level": "danger",
-        "road_status": "Blocked"
-    },
+    # keras_model.h5 (Teachable Machine) — categories not covered by any YOLO model
+    'earthquake':           {'hazard_level': 'danger',   'road_status': 'Structural damage — avoid area'},
+    'smoke':                {'hazard_level': 'moderate', 'road_status': 'Reduced visibility — proceed with caution'},
+    'landslide':             {'hazard_level': 'danger',  'road_status': 'Blocked'},
 }
 
-
-# ============================================================
-# ONNX SESSION
-# ============================================================
-
-def _session(path):
-    """
-    Create a lightweight ONNX Runtime CPU session.
-    """
-
-    so = ort.SessionOptions()
-
-    # Reduce memory usage on free/small hosts
-    so.enable_cpu_mem_arena = False
-    so.enable_mem_pattern = False
-
-    # Render free instances have limited CPU
-    so.intra_op_num_threads = 1
-    so.inter_op_num_threads = 1
-
-    return ort.InferenceSession(
-        str(path),
-        so,
-        providers=["CPUExecutionProvider"]
-    )
-
-
-# ============================================================
-# TEACHABLE MACHINE CLASSIFIER
-# ============================================================
-
-TM_SESSION = None
-TM_CLASS_NAMES = []
+# ---------------------------------------------------------------------
+# Model loading — happens once at import time, not per-request.
+# ---------------------------------------------------------------------
 
 try:
-
-    TM_SESSION = _session(MODEL_DIR / TM_FILE)
-
-    with open(MODEL_DIR / "labels.txt", "r") as f:
-        TM_CLASS_NAMES = [
-            line.strip()
-            for line in f.readlines()
-            if line.strip()
-        ]
-
-    print(
-        f"✓ Teachable Machine classifier loaded: "
-        f"{TM_CLASS_NAMES}"
-    )
-
-except Exception as e:
-
-    print(
-        f"⚠ Teachable Machine model not loaded: {e}"
-    )
-
-
-# ============================================================
-# MODEL AVAILABILITY FLAGS
-# ============================================================
-#
-# IMPORTANT:
-# app.py imports these two variables:
-#
-# from ai_inference import (
-#     analyze_damage_with_yolo,
-#     YOLO_AVAILABLE,
-#     TM_AVAILABLE
-# )
-#
-# They were missing previously and caused the Render
-# ImportError.
-# ============================================================
-
-TM_AVAILABLE = TM_SESSION is not None
-
-YOLO_AVAILABLE = any(
-    (MODEL_DIR / filename).exists()
-    for filename in YOLO_FILES.values()
-)
-
-print(f"✓ YOLO files available: {YOLO_AVAILABLE}")
-print(f"✓ Teachable Machine available: {TM_AVAILABLE}")
-
-
-# ============================================================
-# MODEL STATUS
-# ============================================================
-
-def models_status():
-    """
-    Return the availability of the AI models.
-    """
-
-    return {
-        "teachable_machine": TM_SESSION is not None,
-
-        "yolo_files_present": {
-            name: (MODEL_DIR / filename).exists()
-            for name, filename in YOLO_FILES.items()
-        },
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+    YOLO_MODELS = {
+        'flood': YOLO(str(MODEL_DIR / 'flood_best.pt')),
+        'hazard': YOLO(str(MODEL_DIR / 'hazard_best.pt')),
+        'fire_building': YOLO(str(MODEL_DIR / 'hazard_fire_building_best.pt')),
     }
+    print(f"✓ YOLO models loaded: {list(YOLO_MODELS.keys())}")
+    for name, m in YOLO_MODELS.items():
+        print(f"  - {name}: classes = {m.names}")
+except ImportError:
+    YOLO_AVAILABLE = False
+    YOLO_MODELS = {}
+    print("⚠ YOLOv8 not installed. Install with: pip install ultralytics opencv-python")
+except Exception as e:
+    YOLO_AVAILABLE = False
+    YOLO_MODELS = {}
+    print(f"⚠ YOLO warning: {e}")
+
+try:
+    from tensorflow.keras.models import load_model
+    from PIL import Image, ImageOps
+    import numpy as np
+
+    TM_MODEL = load_model(str(MODEL_DIR / 'keras_model.h5'), compile=False)
+    with open(MODEL_DIR / 'labels.txt', 'r') as f:
+        TM_CLASS_NAMES = [line.strip() for line in f.readlines()]
+    TM_AVAILABLE = True
+    print(f"✓ Teachable Machine classifier loaded: {TM_CLASS_NAMES}")
+except Exception as e:
+    TM_AVAILABLE = False
+    print(f"⚠ Teachable Machine model not loaded: {e}")
 
 
-# ============================================================
-# TEACHABLE MACHINE CLASSIFICATION
-# ============================================================
+# ---------------------------------------------------------------------
+# Inference
+# ---------------------------------------------------------------------
 
 def classify_with_teachable_machine(image_path):
     """
-    Returns:
-
-        (label, confidence)
-
-    or:
-
-        (None, 0.0)
+    Runs the Teachable Machine Keras classifier on the image.
+    Returns (label_lowercase, confidence) or (None, 0.0) if unavailable.
+    Labels file lines look like '0 Earthquake', so we strip the index prefix.
     """
-
-    if TM_SESSION is None:
+    if not TM_AVAILABLE:
         return None, 0.0
-
     try:
-
+        data = np.ndarray(shape=(1, 224, 224, 3), dtype=np.float32)
         image = Image.open(image_path).convert("RGB")
+        image = ImageOps.fit(image, (224, 224), Image.Resampling.LANCZOS)
+        image_array = np.asarray(image)
+        normalized_image_array = (image_array.astype(np.float32) / 127.5) - 1
+        data[0] = normalized_image_array
 
-        image = ImageOps.fit(
-            image,
-            (224, 224),
-            Image.Resampling.LANCZOS
-        )
-
-        # Teachable Machine expects values from -1 to 1
-        arr = (
-            np.asarray(image).astype(np.float32) / 127.5
-        ) - 1.0
-
-        # NHWC
-        data = arr[np.newaxis, ...]
-
-        in_name = TM_SESSION.get_inputs()[0].name
-
-        prediction = TM_SESSION.run(
-            None,
-            {
-                in_name: data
-            }
-        )[0]
-
-        index = int(
-            np.argmax(prediction[0])
-        )
-
+        prediction = TM_MODEL.predict(data, verbose=0)
+        index = np.argmax(prediction)
         raw_label = TM_CLASS_NAMES[index]
-
-        if " " in raw_label:
-            label = raw_label.split(
-                " ",
-                1
-            )[-1].strip().lower()
-        else:
-            label = raw_label.strip().lower()
-
-        confidence = float(
-            prediction[0][index]
-        )
-
+        label = raw_label.split(' ', 1)[-1].strip().lower() if ' ' in raw_label else raw_label.strip().lower()
+        confidence = float(prediction[0][index])
         return label, confidence
-
     except Exception as e:
-
-        print(
-            f"⚠ Teachable Machine classify error: {e}"
-        )
-
+        print(f"⚠ Teachable Machine classify error: {e}")
         traceback.print_exc()
-
         return None, 0.0
 
-
-# ============================================================
-# YOLO
-# ============================================================
-
-_yolo_cache = {}
-
-
-def _load_yolo(name):
-    """
-    Load a YOLO ONNX model.
-
-    If KEEP_LOADED is false, the model is not kept
-    permanently in the cache.
-    """
-
-    if name in _yolo_cache:
-        return _yolo_cache[name]
-
-    path = MODEL_DIR / YOLO_FILES[name]
-
-    if not path.exists():
-        print(
-            f"⚠ YOLO model not found: {path}"
-        )
-        return None
-
-    try:
-
-        sess = _session(path)
-
-        meta = sess.get_modelmeta().custom_metadata_map
-
-        names = {}
-
-        try:
-
-            names = ast.literal_eval(
-                meta.get("names", "{}")
-            )
-
-        except Exception:
-            pass
-
-        entry = {
-            "session": sess,
-            "names": names,
-            "task": meta.get(
-                "task",
-                "detect"
-            )
-        }
-
-        if KEEP_LOADED:
-            _yolo_cache[name] = entry
-
-        return entry
-
-    except Exception as e:
-
-        print(
-            f"⚠ Could not load YOLO model "
-            f"{name}: {e}"
-        )
-
-        return None
-
-
-# ============================================================
-# LETTERBOX
-# ============================================================
-
-def _letterbox(image, size_hw):
-    """
-    Resize image while maintaining aspect ratio
-    and pad with grey pixels.
-    """
-
-    h, w = size_hw
-
-    iw, ih = image.size
-
-    scale = min(
-        w / iw,
-        h / ih
-    )
-
-    nw = max(
-        1,
-        int(round(iw * scale))
-    )
-
-    nh = max(
-        1,
-        int(round(ih * scale))
-    )
-
-    resized = image.resize(
-        (nw, nh),
-        Image.Resampling.BILINEAR
-    )
-
-    canvas = Image.new(
-        "RGB",
-        (w, h),
-        (114, 114, 114)
-    )
-
-    canvas.paste(
-        resized,
-        (
-            (w - nw) // 2,
-            (h - nh) // 2
-        )
-    )
-
-    return canvas
-
-
-# ============================================================
-# YOLO BEST DETECTION
-# ============================================================
-
-def _yolo_best(entry, image):
-    """
-    Get the highest-confidence class from one YOLO model.
-
-    Returns:
-
-        (label, confidence)
-
-    or:
-
-        (None, 0.0)
-    """
-
-    sess = entry["session"]
-
-    names = entry["names"]
-
-    inp = sess.get_inputs()[0]
-
-    shape = inp.shape
-
-    # Default YOLO input size
-    h = (
-        shape[2]
-        if isinstance(shape[2], int)
-        else 640
-    )
-
-    w = (
-        shape[3]
-        if isinstance(shape[3], int)
-        else 640
-    )
-
-    # Resize and normalize
-    arr = np.asarray(
-        _letterbox(
-            image,
-            (h, w)
-        )
-    ).astype(
-        np.float32
-    ) / 255.0
-
-    # HWC -> CHW
-    tensor = np.transpose(
-        arr,
-        (2, 0, 1)
-    )[np.newaxis, ...]
-
-    # Run inference
-    out = sess.run(
-        None,
-        {
-            inp.name: tensor
-        }
-    )[0]
-
-    # Classification model
-    if entry["task"] == "classify":
-
-        scores = out[0]
-
-    else:
-
-        # Detection / segmentation
-        nc = (
-            len(names)
-            if names
-            else out.shape[1] - 4
-        )
-
-        scores = out[0][
-            4:4 + nc,
-            :
-        ].max(axis=1)
-
-    idx = int(
-        np.argmax(scores)
-    )
-
-    conf = float(
-        scores[idx]
-    )
-
-    if conf < YOLO_CONF:
-        return None, 0.0
-
-    return (
-        str(
-            names.get(
-                idx,
-                idx
-            )
-        ).lower(),
-        conf
-    )
-
-
-# ============================================================
-# MAIN AI ANALYSIS
-# ============================================================
 
 def analyze_damage_with_yolo(image_path):
     """
-    Run the complete SafeSense AI pipeline.
+    Fast first pass: Teachable Machine classifier.
+    If it confidently says "normal", skip YOLO entirely and return safe
+    (big speed win for the common case where nothing's actually wrong).
+    Otherwise, run all trained YOLO models too and keep whichever single
+    result (YOLO or Teachable Machine) is more confident.
 
-    Returns:
-
-    {
-        "damage_type": "...",
-        "hazard_level": "...",
-        "confidence": 0.0,
-        "road_status": "..."
-    }
+    Returns a dict: {damage_type, hazard_level, confidence, road_status}
+    — this exact shape is what Flutter's ResultPage and FirestoreService
+    expect; don't rename these keys without updating both.
     """
+    tm_label, tm_conf = classify_with_teachable_machine(image_path)
 
-    # --------------------------------------------------------
-    # STEP 1: Teachable Machine
-    # --------------------------------------------------------
-
-    tm_label, tm_conf = (
-        classify_with_teachable_machine(
-            image_path
-        )
-    )
-
-    # If the image is confidently normal,
-    # immediately classify it as safe.
-    if (
-        tm_label == "normal"
-        and tm_conf > 0.6
-    ):
-
+    if tm_label == 'normal' and tm_conf > 0.6:
         return {
-            "damage_type": "none",
-            "hazard_level": "safe",
-            "confidence": round(
-                tm_conf,
-                2
-            ),
-            "road_status": "Clear"
+            'damage_type': 'none',
+            'hazard_level': 'safe',
+            'confidence': round(tm_conf, 2),
+            'road_status': 'Clear'
         }
 
-    # --------------------------------------------------------
-    # STEP 2: YOLO MODELS
-    # --------------------------------------------------------
+    if not YOLO_AVAILABLE:
+        if tm_label:
+            info = CLASS_INFO.get(tm_label, {'hazard_level': 'moderate', 'road_status': 'Unknown'})
+            return {
+                'damage_type': tm_label,
+                'hazard_level': info['hazard_level'],
+                'confidence': round(tm_conf, 2),
+                'road_status': info['road_status']
+            }
+        return {
+            'damage_type': 'flood',
+            'hazard_level': 'moderate',
+            'confidence': 0.65,
+            'road_status': 'Partially blocked'
+        }
 
     try:
-
-        image = Image.open(
-            image_path
-        ).convert("RGB")
-
         best_label = None
         best_conf = 0.0
 
-        # Run all YOLO models
-        for name in YOLO_FILES:
+        for model_name, model in YOLO_MODELS.items():
+            results = model.predict(image_path, conf=0.4, verbose=False)
+            for r in results:
+                if r.boxes is None or len(r.boxes) == 0:
+                    continue
+                for box in r.boxes:
+                    conf = float(box.conf[0])
+                    cls_id = int(box.cls[0])
+                    label = model.names[cls_id]
+                    if conf > best_conf:
+                        best_conf = conf
+                        best_label = label.lower()
 
-            entry = _load_yolo(name)
-
-            if entry is None:
-                continue
-
-            try:
-
-                label, conf = _yolo_best(
-                    entry,
-                    image
-                )
-
-                if (
-                    label is not None
-                    and conf > best_conf
-                ):
-
-                    best_label = label
-                    best_conf = conf
-
-            finally:
-
-                del entry
-
-                # Free memory on small hosts
-                if not KEEP_LOADED:
-                    gc.collect()
-
-        # ----------------------------------------------------
-        # STEP 3: Compare Teachable Machine result
-        # ----------------------------------------------------
-
-        if (
-            tm_label
-            and tm_label != "normal"
-            and tm_conf > best_conf
-        ):
-
-            best_label = tm_label
+        if tm_label and tm_label != 'normal' and tm_conf > best_conf:
             best_conf = tm_conf
-
-        # ----------------------------------------------------
-        # No detection
-        # ----------------------------------------------------
+            best_label = tm_label
 
         if best_label is None:
-
             return {
-                "damage_type": "none",
-                "hazard_level": "safe",
-                "confidence": 0.0,
-                "road_status": "Clear"
+                'damage_type': 'none',
+                'hazard_level': 'safe',
+                'confidence': 0.0,
+                'road_status': 'Clear'
             }
 
-        # ----------------------------------------------------
-        # Get hazard information
-        # ----------------------------------------------------
-
-        info = CLASS_INFO.get(
-            best_label,
-            {
-                "hazard_level": "moderate",
-                "road_status": "Unknown"
-            }
-        )
+        info = CLASS_INFO.get(best_label, {'hazard_level': 'moderate', 'road_status': 'Unknown'})
 
         return {
-            "damage_type": best_label,
-
-            "hazard_level": info[
-                "hazard_level"
-            ],
-
-            "confidence": round(
-                best_conf,
-                2
-            ),
-
-            "road_status": info[
-                "road_status"
-            ]
+            'damage_type': best_label,
+            'hazard_level': info['hazard_level'],
+            'confidence': round(best_conf, 2),
+            'road_status': info['road_status']
         }
 
     except Exception as e:
-
-        print(
-            f"⚠ YOLO error: {e}"
-        )
-
+        print(f"⚠ YOLO error: {e}")
         traceback.print_exc()
-
         return {
-            "damage_type": "unknown",
-            "hazard_level": "moderate",
-            "confidence": 0.5,
-            "road_status": "Unknown"
+            'damage_type': 'unknown',
+            'hazard_level': 'moderate',
+            'confidence': 0.5,
+            'road_status': 'Unknown'
         }
-
-
-# ============================================================
-# COMMAND LINE TEST
-# ============================================================
-
-if __name__ == "__main__":
-
-    if len(sys.argv) < 2:
-
-        print(
-            "Usage: python ai_inference.py <image.jpg>"
-        )
-
-        sys.exit(1)
-
-    result = analyze_damage_with_yolo(
-        sys.argv[1]
-    )
-
-    print(result)
