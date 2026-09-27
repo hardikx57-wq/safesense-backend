@@ -17,7 +17,11 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 import pymysql
 
+import json
+
 from ai_inference import analyze_damage_with_yolo, models_status
+
+
 
 # ==============================================================================
 # 1. APPLICATION & CONFIGURATION SETUP
@@ -44,18 +48,18 @@ MYSQL_DB = os.getenv("MYSQL_DB", "defaultdb")
 # ==============================================================================
 def init_firebase():
     if not firebase_admin._apps:
-        # Check if credential file path exists in environment or locally
-        cred_path = os.getenv("FIREBASE_CREDENTIALS_PATH")
+        # Check for JSON content directly in environment variable
+        firebase_json_env = os.getenv("FIREBASE_CREDENTIALS_JSON")
         
-        if cred_path and os.path.exists(cred_path):
-            cred = credentials.Certificate(cred_path)
+        if firebase_json_env:
+            cred_dict = json.loads(firebase_json_env)
+            cred = credentials.Certificate(cred_dict)
         else:
-            # Look in current working directory for json file
+            # Fallback to local JSON file if present
             json_files = [f for f in os.listdir(".") if f.endswith(".json") and "firebase" in f]
             if json_files:
                 cred = credentials.Certificate(json_files[0])
             else:
-                # Use Google Application Default Credentials if no file found
                 cred = credentials.ApplicationDefault()
                 
         firebase_admin.initialize_app(cred)
