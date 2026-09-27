@@ -9,3 +9,4 @@ ultralytics
 opencv-python
 tensorflow==2.15.0
 pillow==12.3.0
+gunicorn==23.0.0
