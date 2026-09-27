@@ -543,3 +543,4 @@ def get_user_reports(user_id):
             """
             SELECT dr.detection_id AS id, dr.damage_type, dr.severity AS hazard_level,
                    dr.confidence, dr.road_status, ui.latitude, ui.longitude, dr.detected_at AS created_
+                   """
