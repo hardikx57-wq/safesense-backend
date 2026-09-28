@@ -185,7 +185,7 @@ def home():
         "message": "SafeSense Backend is running!",
         "status": "OK",
         "version": "1.0.1",
-        "firebase_ready": firestore_client is not None
+        "sync_ready": firestore_client is not None
     })
 
 
@@ -315,19 +315,71 @@ def register():
         return jsonify({"error": str(e)}), 500
 
 
-# ========== FIREBASE -> MYSQL SYNC ==========
+# ========== CLOUD -> MYSQL SYNC (users, reports, shelters) ==========
 
+USERS_COLLECTION = os.getenv('USERS_COLLECTION', 'users').strip()
+REPORTS_COLLECTION = os.getenv('REPORTS_COLLECTION', 'reports').strip()
+SHELTERS_COLLECTION = os.getenv('SHELTERS_COLLECTION', 'shelters').strip()
+
+
+def _pick(d, *keys, default=None):
+    """Return the first non-empty value among several possible field names."""
+    for k in keys:
+        if k in d and d[k] not in (None, ''):
+            return d[k]
+    return default
+
+
+def _to_dt(v):
+    return v.strftime('%Y-%m-%d %H:%M:%S') if hasattr(v, 'strftime') else None
+
+
+def _to_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(v):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def _coords(d):
+    """Find latitude/longitude whether stored as two fields or a GeoPoint/map."""
+    lat = _pick(d, 'latitude', 'lat')
+    lng = _pick(d, 'longitude', 'lng', 'lon', 'long')
+    if lat is None or lng is None:
+        loc = _pick(d, 'location', 'position', 'geo', 'coordinates')
+        if loc is not None:
+            if hasattr(loc, 'latitude'):
+                lat, lng = loc.latitude, loc.longitude
+            elif isinstance(loc, dict):
+                lat = loc.get('latitude', loc.get('lat'))
+                lng = loc.get('longitude', loc.get('lng', loc.get('lon')))
+    return _to_float(lat), _to_float(lng)
+
+
+def _raw(d):
+    """Whole original document as JSON text so no field is ever lost."""
+    return json.dumps(d, default=str)
+
+
+@app.route('/api/sync-all', methods=['GET', 'POST'])
 @app.route('/api/sync-all-users', methods=['GET', 'POST'])
-def sync_all_users():
+def sync_all():
     """
-    Pulls EVERY user from the Firestore `users` collection and upserts them
-    into a MySQL `firebase_users` table.
+    Copies users, reports and shelters from the cloud database into the
+    MySQL tables app_users, reports and shelters (upsert — safe to re-run).
 
-    Protected by a shared secret: /api/sync-all-users?key=YOUR_SECRET
-    Set ADMIN_SYNC_KEY in Render's environment.
+    Protected by a shared secret: /api/sync-all?key=YOUR_SECRET
+    (ADMIN_SYNC_KEY in Render's environment).
     """
     if firestore_client is None:
-        return jsonify({'error': 'Firebase Admin not configured on server'}), 500
+        return jsonify({'error': 'Cloud database not configured on server'}), 500
 
     expected_key = os.getenv('ADMIN_SYNC_KEY', '').strip()
     if not expected_key:
@@ -339,58 +391,154 @@ def sync_all_users():
     if not conn:
         return jsonify({'error': 'Database connection failed', 'detail': LAST_DB_ERROR}), 500
 
-    synced = []
+    counts = {'app_users': 0, 'reports': 0, 'shelters': 0}
     try:
         cursor = conn.cursor()
+
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS firebase_users (
-                firebase_uid VARCHAR(128) PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS app_users (
+                user_uid VARCHAR(128) PRIMARY KEY,
                 name VARCHAR(255),
                 email VARCHAR(255),
                 phone VARCHAR(50),
                 role VARCHAR(50),
                 created_at DATETIME NULL,
-                last_synced_at DATETIME NOT NULL
+                last_synced_at DATETIME NOT NULL,
+                raw_data JSON NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reports (
+                report_id VARCHAR(128) PRIMARY KEY,
+                user_uid VARCHAR(128),
+                damage_type VARCHAR(100),
+                hazard_level VARCHAR(50),
+                confidence DOUBLE NULL,
+                road_status VARCHAR(255),
+                description TEXT,
+                image_url TEXT,
+                latitude DOUBLE NULL,
+                longitude DOUBLE NULL,
+                status VARCHAR(50),
+                created_at DATETIME NULL,
+                last_synced_at DATETIME NOT NULL,
+                raw_data JSON NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS shelters (
+                shelter_id VARCHAR(128) PRIMARY KEY,
+                name VARCHAR(255),
+                address TEXT,
+                phone VARCHAR(50),
+                capacity INT NULL,
+                latitude DOUBLE NULL,
+                longitude DOUBLE NULL,
+                status VARCHAR(50),
+                created_at DATETIME NULL,
+                last_synced_at DATETIME NOT NULL,
+                raw_data JSON NULL
             )
         """)
 
-        for doc in firestore_client.collection('users').stream():
-            uid = doc.id
-            profile = doc.to_dict() or {}
-
-            name = profile.get('name', '')
-            email = profile.get('email', '')
-            phone = profile.get('phone', '')
-            role = profile.get('role', 'user')
-            created_at = profile.get('createdAt')
-            created_at_sql = (
-                created_at.strftime('%Y-%m-%d %H:%M:%S')
-                if hasattr(created_at, 'strftime') else None
-            )
-
+        # ---- users ----
+        for doc in firestore_client.collection(USERS_COLLECTION).stream():
+            p = doc.to_dict() or {}
             cursor.execute("""
-                INSERT INTO firebase_users (firebase_uid, name, email, phone, role, created_at, last_synced_at)
-                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                INSERT INTO app_users (user_uid, name, email, phone, role, created_at, last_synced_at, raw_data)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s)
                 ON DUPLICATE KEY UPDATE
-                    name = VALUES(name),
-                    email = VALUES(email),
-                    phone = VALUES(phone),
-                    role = VALUES(role),
-                    last_synced_at = NOW()
-            """, (uid, name, email, phone, role, created_at_sql))
-            synced.append({'uid': uid, 'name': name, 'email': email, 'Role': role})
+                    name = VALUES(name), email = VALUES(email), phone = VALUES(phone),
+                    role = VALUES(role), created_at = VALUES(created_at),
+                    last_synced_at = NOW(), raw_data = VALUES(raw_data)
+            """, (
+                doc.id,
+                _pick(p, 'name', 'displayName', default=''),
+                _pick(p, 'email', default=''),
+                _pick(p, 'phone', 'phoneNumber', default=''),
+                _pick(p, 'role', default='user'),
+                _to_dt(_pick(p, 'createdAt', 'created_at')),
+                _raw(p),
+            ))
+            counts['app_users'] += 1
+
+        # ---- reports ----
+        for doc in firestore_client.collection(REPORTS_COLLECTION).stream():
+            p = doc.to_dict() or {}
+            lat, lng = _coords(p)
+            cursor.execute("""
+                INSERT INTO reports (report_id, user_uid, damage_type, hazard_level, confidence,
+                                     road_status, description, image_url, latitude, longitude,
+                                     status, created_at, last_synced_at, raw_data)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+                ON DUPLICATE KEY UPDATE
+                    user_uid = VALUES(user_uid), damage_type = VALUES(damage_type),
+                    hazard_level = VALUES(hazard_level), confidence = VALUES(confidence),
+                    road_status = VALUES(road_status), description = VALUES(description),
+                    image_url = VALUES(image_url), latitude = VALUES(latitude),
+                    longitude = VALUES(longitude), status = VALUES(status),
+                    created_at = VALUES(created_at), last_synced_at = NOW(),
+                    raw_data = VALUES(raw_data)
+            """, (
+                doc.id,
+                str(_pick(p, 'userId', 'user_id', 'uid', 'reportedBy', default='')),
+                _pick(p, 'damage_type', 'damageType', 'type', default=''),
+                _pick(p, 'hazard_level', 'hazardLevel', 'severity', default=''),
+                _to_float(_pick(p, 'confidence')),
+                _pick(p, 'road_status', 'roadStatus', default=''),
+                _pick(p, 'description', 'desc', default=''),
+                _pick(p, 'imageUrl', 'image_url', 'image', 'photoUrl', default=''),
+                lat, lng,
+                _pick(p, 'status', default=''),
+                _to_dt(_pick(p, 'createdAt', 'created_at', 'timestamp', 'time')),
+                _raw(p),
+            ))
+            counts['reports'] += 1
+
+        # ---- shelters ----
+        for doc in firestore_client.collection(SHELTERS_COLLECTION).stream():
+            p = doc.to_dict() or {}
+            lat, lng = _coords(p)
+            cursor.execute("""
+                INSERT INTO shelters (shelter_id, name, address, phone, capacity, latitude,
+                                      longitude, status, created_at, last_synced_at, raw_data)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+                ON DUPLICATE KEY UPDATE
+                    name = VALUES(name), address = VALUES(address), phone = VALUES(phone),
+                    capacity = VALUES(capacity), latitude = VALUES(latitude),
+                    longitude = VALUES(longitude), status = VALUES(status),
+                    created_at = VALUES(created_at), last_synced_at = NOW(),
+                    raw_data = VALUES(raw_data)
+            """, (
+                doc.id,
+                _pick(p, 'name', 'title', 'shelterName', default=''),
+                _pick(p, 'address', 'location_name', 'locationName', default=''),
+                _pick(p, 'phone', 'contact', 'phoneNumber', default=''),
+                _to_int(_pick(p, 'capacity', 'beds')),
+                lat, lng,
+                _pick(p, 'status', default=''),
+                _to_dt(_pick(p, 'createdAt', 'created_at')),
+                _raw(p),
+            ))
+            counts['shelters'] += 1
 
         conn.commit()
         cursor.close()
     except Error as e:
-        return jsonify({'error': f'Database error: {e}'}), 500
+        return jsonify({'error': f'Database error: {e}', 'synced_so_far': counts}), 500
     except Exception as e:
         traceback.print_exc()
-        return jsonify({'error': f'Sync failed: {e}'}), 500
+        return jsonify({'error': f'Sync failed: {e}', 'synced_so_far': counts}), 500
     finally:
         conn.close()
 
-    return jsonify({'synced_count': len(synced), 'users': synced}), 200
+    return jsonify({
+        'status': 'success',
+        'users_synced': counts['app_users'],
+        'reports_synced': counts['reports'],
+        'shelters_synced': counts['shelters'],
+        'collections_read': [USERS_COLLECTION, REPORTS_COLLECTION, SHELTERS_COLLECTION]
+    }), 200
 
 
 # ========== AI ANALYSIS ==========
