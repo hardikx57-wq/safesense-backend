@@ -377,8 +377,8 @@ def sync_all_users():
                     phone = VALUES(phone),
                     role = VALUES(role),
                     last_synced_at = NOW()
-            """, (firebase_uid, name, email, phone, role, created_at_sql))
-            synced.append({'uid': firebase_uid, 'name': name, 'email': email, 'Role':role})
+            """, (uid, name, email, phone, role, created_at_sql))
+            synced.append({'uid': uid, 'name': name, 'email': email, 'Role': role})
 
         conn.commit()
         cursor.close()
