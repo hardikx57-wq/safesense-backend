@@ -369,7 +369,7 @@ def sync_all_users():
             )
 
             cursor.execute("""
-                INSERT INTO users (uid, name, email, phone, role, created_at, last_synced_at)
+                INSERT INTO firebase_users (uid, name, email, phone, role, created_at, last_synced_at)
                 VALUES (%s, %s, %s, %s, %s, %s, NOW())
                 ON DUPLICATE KEY UPDATE
                     name = VALUES(name),
@@ -378,7 +378,7 @@ def sync_all_users():
                     role = VALUES(role),
                     last_synced_at = NOW()
             """, (uid, name, email, phone, role, created_at_sql))
-            synced.append({'uid': uid, 'name': name, 'email': email})
+            synced.append({'uid': uid, 'name': name, 'email': email, 'Role':role})
 
         conn.commit()
         cursor.close()
