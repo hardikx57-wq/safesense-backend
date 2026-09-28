@@ -26,7 +26,6 @@ CORS(app, resources={r"/api/*": {"origins": "*", "allow_headers": ["Authorizatio
 
 # ========== CONFIGURATION ==========
 DB_HOST = os.getenv('DB_HOST', 'localhost')
-DB_PORT = int(os.getenv('DB_PORT', '3306'))
 DB_USER = os.getenv('DB_USER', 'root')
 DB_PASSWORD = os.getenv('DB_PASSWORD', '')
 DB_NAME = os.getenv('DB_NAME', 'safesense')
@@ -44,61 +43,31 @@ import json
 import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth, firestore as admin_firestore
 
-# Preferred: Render "Secret Files" — upload the actual serviceAccount.json
-# directly in Render's dashboard (Environment -> Secret Files), filename
-# firebase-service-account.json. Render mounts it at this exact path.
-# This avoids ever pasting the huge base64 string into a text box, which is
-# what corrupted things last time.
-RENDER_SECRET_FILE_PATH = '/etc/secrets/firebase-service-account.json'
-
-# Fallback: base64 env var, kept for local dev / if you prefer that route.
 FIREBASE_SERVICE_ACCOUNT_B64 = os.getenv('FIREBASE_SERVICE_ACCOUNT_B64', '')
-
 firestore_client = None
-service_account_info = None
-
-if os.path.exists(RENDER_SECRET_FILE_PATH):
-    try:
-        with open(RENDER_SECRET_FILE_PATH, 'r') as f:
-            service_account_info = json.load(f)
-        print("✓ Loaded Firebase service account from Render Secret File")
-    except Exception as e:
-        print(f"❌ Failed reading Secret File: {e}")
-elif FIREBASE_SERVICE_ACCOUNT_B64:
+if FIREBASE_SERVICE_ACCOUNT_B64:
     try:
         service_account_info = json.loads(base64.b64decode(FIREBASE_SERVICE_ACCOUNT_B64))
-        print("✓ Loaded Firebase service account from base64 env var")
-    except Exception as e:
-        print(f"❌ Failed decoding FIREBASE_SERVICE_ACCOUNT_B64: {e}")
-
-if service_account_info:
-    try:
         cred = credentials.Certificate(service_account_info)
         firebase_admin.initialize_app(cred)
         firestore_client = admin_firestore.client()
-        print(f"✓ Firebase Admin initialized (project: {service_account_info.get('project_id', '?')})")
+        print("✓ Firebase Admin initialized")
     except Exception as e:
         print(f"❌ Firebase Admin init failed: {e}")
 else:
-    print("⚠ No Firebase service account found (Secret File or env var) — /api/sync-all-users will be unavailable")
+    print("⚠ FIREBASE_SERVICE_ACCOUNT_B64 not set — /api/sync-user will be unavailable")
 
 # ========== DATABASE HELPERS ==========
-# Aiven requires an SSL connection. Preferred: upload the .pem as a Render
-# Secret File named "aiven-ca.pem" (Environment -> Secret Files) — Render
-# mounts it directly, no copy-pasting a long cert string anywhere.
-# Fallback: base64 env var DB_SSL_CA_B64, written to a temp file at startup.
-RENDER_CA_SECRET_PATH = '/etc/secrets/aiven-ca.pem'
+# Aiven requires an SSL connection. The CA cert is passed in as a base64
+# env var (DB_SSL_CA_B64) and written to a temp file once at startup, since
+# mysql.connector needs an actual file path, not raw cert text.
 DB_SSL_CA_B64 = os.getenv('DB_SSL_CA_B64', '')
 DB_SSL_CA_PATH = None
-
-if os.path.exists(RENDER_CA_SECRET_PATH):
-    DB_SSL_CA_PATH = RENDER_CA_SECRET_PATH
-    print("✓ Using Aiven CA certificate from Render Secret File")
-elif DB_SSL_CA_B64:
+if DB_SSL_CA_B64:
     DB_SSL_CA_PATH = '/tmp/aiven-ca.pem'
     with open(DB_SSL_CA_PATH, 'wb') as f:
         f.write(base64.b64decode(DB_SSL_CA_B64))
-    print("✓ Aiven CA certificate written from base64 env var")
+    print("✓ DB SSL CA certificate written for MySQL connection")
 
 
 def get_db_connection():
@@ -106,7 +75,6 @@ def get_db_connection():
     try:
         connect_kwargs = dict(
             host=DB_HOST,
-            port=DB_PORT,
             user=DB_USER,
             password=DB_PASSWORD,
             database=DB_NAME,
@@ -535,3 +503,162 @@ def upload_report():
                 "location": {"lat": latitude, "lng": longitude}
             }), 201
         else:
+            return jsonify({"error": "Failed to store report"}), 400
+
+    except Exception as e:
+        print(f"🔴 [FATAL] Unhandled exception: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/reports/hazards', methods=['GET'])
+def get_hazards():
+    """Get all active hazard reports for the map"""
+    try:
+        hazards = query_db(
+            """
+            SELECT dr.detection_id AS id, dr.damage_type, dr.severity AS hazard_level,
+                   dr.confidence, dr.road_status, ui.latitude, ui.longitude, dr.detected_at AS created_at
+            FROM detection_result dr
+            JOIN uploaded_image ui ON dr.image_id = ui.image_id
+            WHERE ui.status = 'approved'
+            ORDER BY dr.detected_at DESC
+            LIMIT 100
+            """
+        )
+
+        return jsonify({
+            "status": "success",
+            "hazards": hazards or []
+        }), 200
+    except Exception as e:
+        print(f"Get hazards error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/reports/user/<int:user_id>', methods=['GET'])
+@require_auth
+def get_user_reports(user_id):
+    """Get reports submitted by a specific user"""
+    try:
+        reports = query_db(
+            """
+            SELECT dr.detection_id AS id, dr.damage_type, dr.severity AS hazard_level,
+                   dr.confidence, dr.road_status, ui.latitude, ui.longitude, dr.detected_at AS created_at
+            FROM detection_result dr
+            JOIN uploaded_image ui ON dr.image_id = ui.image_id
+            WHERE ui.user_id = %s
+            ORDER BY dr.detected_at DESC
+            """,
+            (user_id,)
+        )
+
+        return jsonify({
+            "status": "success",
+            "reports": reports or []
+        }), 200
+    except Exception as e:
+        print(f"Get user reports error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/reports/nearby', methods=['GET'])
+def get_nearby_hazards():
+    """Get hazards near a location (for dashboard)"""
+    try:
+        lat = float(request.args.get('lat', 19.2456))
+        lng = float(request.args.get('lng', 73.1300))
+        radius_km = float(request.args.get('radius', 5))
+
+        hazards = query_db(
+            """
+            SELECT dr.detection_id AS id, dr.damage_type, dr.severity AS hazard_level,
+                   dr.confidence, dr.road_status, ui.latitude, ui.longitude, dr.detected_at AS created_at,
+                   (6371 * acos(cos(radians(%s)) * cos(radians(ui.latitude)) * cos(radians(ui.longitude) - radians(%s)) + sin(radians(%s)) * sin(radians(ui.latitude)))) AS distance
+            FROM detection_result dr
+            JOIN uploaded_image ui ON dr.image_id = ui.image_id
+            WHERE ui.status = 'approved'
+            HAVING distance < %s
+            ORDER BY distance ASC
+            LIMIT 20
+            """,
+            (lat, lng, lat, radius_km)
+        )
+
+        return jsonify({
+            "status": "success",
+            "nearby_hazards": hazards or []
+        }), 200
+    except Exception as e:
+        print(f"Get nearby hazards error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ========== SHELTERS & ROUTE PLANNING ==========
+
+@app.route('/api/shelters', methods=['GET'])
+def get_shelters():
+    """Get all shelters for rescue guidance"""
+    try:
+        shelters = query_db(
+            "SELECT shelter_id AS id, name, latitude, longitude, capacity, occupancy AS current_occupancy, contact AS phone, status FROM shelter"
+        )
+
+        return jsonify({
+            "status": "success",
+            "shelters": shelters or []
+        }), 200
+    except Exception as e:
+        print(f"Get shelters error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/shelters/nearest', methods=['GET'])
+def get_nearest_shelter():
+    """Find nearest safe shelter from a location"""
+    try:
+        lat = float(request.args.get('lat', 19.2456))
+        lng = float(request.args.get('lng', 73.1300))
+
+        shelter = query_db(
+            """
+            SELECT shelter_id AS id, name, latitude, longitude, capacity,
+                   occupancy AS current_occupancy, contact AS phone, status,
+                   (6371 * acos(cos(radians(%s)) * cos(radians(latitude)) * cos(radians(longitude) - radians(%s)) + sin(radians(%s)) * sin(radians(latitude)))) AS distance_km
+            FROM shelter
+            WHERE status = 'available'
+            ORDER BY distance_km ASC
+            LIMIT 1
+            """,
+            (lat, lng, lat)
+        )
+
+        if shelter:
+            return jsonify({
+                "status": "success",
+                "nearest_shelter": shelter[0]
+            }), 200
+        else:
+            return jsonify({"error": "No shelters found"}), 404
+    except Exception as e:
+        print(f"Get nearest shelter error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ========== ERROR HANDLER ==========
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"error": "Endpoint not found"}), 404
+
+@app.errorhandler(500)
+def server_error(error):
+    return jsonify({"error": "Internal server error"}), 500
+
+# ========== RUN ==========
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("SafeSense Backend Starting...")
+    print("=" * 60)
+    print(f"✓ Database: {DB_HOST} / {DB_NAME} (user: {DB_USER}, pass: {'***' if DB_PASSWORD else '(empty)'})")
+    print(f"✓ YOLOv8: {'Available' if YOLO_AVAILABLE else 'Not installed (optional)'}")
+    print(f"✓ Teachable Machine: {'Available' if TM_AVAILABLE else 'Not installed (optional)'}")
+    print(f"✓ JWT Auth: Enabled (token expires in {JWT_EXPIRY_HOURS}h)")
+    print("✓ Running on http://0.0.0.0:5000")
+    print("=" * 60)
+    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True, use_reloader=False)
