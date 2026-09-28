@@ -344,7 +344,7 @@ def sync_all_users():
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS firebase_users (
-                firebase_uid VARCHAR(128) PRIMARY KEY,
+                uid VARCHAR(128) PRIMARY KEY,
                 name VARCHAR(255),
                 email VARCHAR(255),
                 phone VARCHAR(50),
@@ -369,7 +369,7 @@ def sync_all_users():
             )
 
             cursor.execute("""
-                INSERT INTO firebase_users (firebase_uid, name, email, phone, role, created_at, last_synced_at)
+                INSERT INTO users (uid, name, email, phone, role, created_at, last_synced_at)
                 VALUES (%s, %s, %s, %s, %s, %s, NOW())
                 ON DUPLICATE KEY UPDATE
                     name = VALUES(name),
@@ -378,7 +378,7 @@ def sync_all_users():
                     role = VALUES(role),
                     last_synced_at = NOW()
             """, (uid, name, email, phone, role, created_at_sql))
-            synced.append({'firebase_uid': uid, 'name': name, 'email': email})
+            synced.append({'uid': uid, 'name': name, 'email': email})
 
         conn.commit()
         cursor.close()
