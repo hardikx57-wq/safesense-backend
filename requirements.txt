@@ -1,12 +1,16 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 flask==3.1.1
 flask-cors==5.0.1
+gunicorn
 python-dotenv==1.1.0
 mysql-connector-python==9.3.0
 bcrypt==4.3.0
 PyJWT==2.10.1
 firebase-admin
-gunicorn
-ultralytics
-opencv-python
-tensorflow==2.15.0
 pillow==12.3.0
+numpy==1.26.4
+opencv-python-headless
+tensorflow-cpu==2.15.0
+torch==2.2.2+cpu
+torchvision==0.17.2+cpu
+ultralytics

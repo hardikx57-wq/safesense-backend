@@ -11,6 +11,8 @@ import traceback
 import bcrypt
 import jwt
 import functools
+import base64
+import json
 
 # Load environment variables — find .env next to this script
 dotenv_path = Path(__file__).parent / '.env'
@@ -25,29 +27,37 @@ app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*", "allow_headers": ["Authorization", "Content-Type"], "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"]}})
 
 # ========== CONFIGURATION ==========
-DB_HOST = os.getenv('DB_HOST', 'localhost')
-DB_USER = os.getenv('DB_USER', 'root')
-DB_PASSWORD = os.getenv('DB_PASSWORD', '')
-DB_NAME = os.getenv('DB_NAME', 'safesense')
+DB_HOST = os.getenv('DB_HOST', 'localhost').strip()
+DB_PORT = int(os.getenv('DB_PORT', '3306').strip() or '3306')
+DB_USER = os.getenv('DB_USER', 'root').strip()
+DB_PASSWORD = os.getenv('DB_PASSWORD', '').strip()
+DB_NAME = os.getenv('DB_NAME', 'defaultdb').strip()
 JWT_SECRET = os.getenv('JWT_SECRET', os.urandom(32).hex())
 JWT_EXPIRY_HOURS = int(os.getenv('JWT_EXPIRY_HOURS', '24'))
 
-# AI inference — model loading and detection logic lives in ai_inference.py
-# now (Stage 7 cleanup), not inline here. See that file's module docstring
-# for how the two-stage pipeline works and AI_SETUP.md for setup/deployment.
-from ai_inference import analyze_damage_with_yolo, YOLO_AVAILABLE, TM_AVAILABLE
+# NOTE: ai_inference (TensorFlow + YOLO) is imported lazily inside the AI
+# routes below. Loading it at startup is slow and memory-heavy, which made
+# Render's free instance time out ("Port scan timeout"). Now the server
+# opens its port immediately and models load on the first AI request.
 
-# ========== FIREBASE ADMIN (for verifying tokens + reading Firestore) ==========
-import base64
-import json
+# ========== FIREBASE ADMIN ==========
 import firebase_admin
-from firebase_admin import credentials, auth as firebase_auth, firestore as admin_firestore
+from firebase_admin import credentials, firestore as admin_firestore
 
-FIREBASE_SERVICE_ACCOUNT_B64 = os.getenv('FIREBASE_SERVICE_ACCOUNT_B64', '')
+# Accept either variable name, and either raw JSON or base64-encoded JSON.
+_firebase_raw = (
+    os.getenv('FIREBASE_SERVICE_ACCOUNT_B64')
+    or os.getenv('FIREBASE_CREDENTIALS')
+    or ''
+).strip()
+
 firestore_client = None
-if FIREBASE_SERVICE_ACCOUNT_B64:
+if _firebase_raw:
     try:
-        service_account_info = json.loads(base64.b64decode(FIREBASE_SERVICE_ACCOUNT_B64))
+        if _firebase_raw.startswith('{'):
+            service_account_info = json.loads(_firebase_raw, strict=False)
+        else:
+            service_account_info = json.loads(base64.b64decode(_firebase_raw))
         cred = credentials.Certificate(service_account_info)
         firebase_admin.initialize_app(cred)
         firestore_client = admin_firestore.client()
@@ -55,45 +65,61 @@ if FIREBASE_SERVICE_ACCOUNT_B64:
     except Exception as e:
         print(f"❌ Firebase Admin init failed: {e}")
 else:
-    print("⚠ FIREBASE_SERVICE_ACCOUNT_B64 not set — /api/sync-user will be unavailable")
+    print("⚠ Firebase credentials not set — /api/sync-all-users will be unavailable")
 
 # ========== DATABASE HELPERS ==========
-# Aiven requires an SSL connection. The CA cert is passed in as a base64
-# env var (DB_SSL_CA_B64) and written to a temp file once at startup, since
-# mysql.connector needs an actual file path, not raw cert text.
-DB_SSL_CA_B64 = os.getenv('DB_SSL_CA_B64', '')
+# Aiven requires SSL. The CA cert may be given raw (-----BEGIN CERTIFICATE-----)
+# or base64-encoded in DB_SSL_CA_B64. It's written to a temp file at startup.
+DB_SSL_CA_B64 = os.getenv('DB_SSL_CA_B64', '').strip()
 DB_SSL_CA_PATH = None
 if DB_SSL_CA_B64:
-    DB_SSL_CA_PATH = '/tmp/aiven-ca.pem'
-    with open(DB_SSL_CA_PATH, 'wb') as f:
-        f.write(base64.b64decode(DB_SSL_CA_B64))
-    print("✓ DB SSL CA certificate written for MySQL connection")
+    try:
+        DB_SSL_CA_PATH = '/tmp/aiven-ca.pem'
+        if DB_SSL_CA_B64.startswith('-----BEGIN'):
+            ca_bytes = DB_SSL_CA_B64.encode('utf-8')
+        else:
+            ca_bytes = base64.b64decode(DB_SSL_CA_B64)
+        with open(DB_SSL_CA_PATH, 'wb') as f:
+            f.write(ca_bytes)
+        print("✓ DB SSL CA certificate written for MySQL connection")
+    except Exception as e:
+        DB_SSL_CA_PATH = None
+        print(f"❌ Failed to write DB SSL CA certificate: {e}")
+
+LAST_DB_ERROR = None
 
 
 def get_db_connection():
-    """Get a fresh database connection (SSL-enabled if DB_SSL_CA_B64 is set)"""
+    """Get a fresh database connection (SSL-enabled if a CA cert is set)"""
+    global LAST_DB_ERROR
     try:
         connect_kwargs = dict(
             host=DB_HOST,
+            port=DB_PORT,
             user=DB_USER,
             password=DB_PASSWORD,
             database=DB_NAME,
-            autocommit=True
+            autocommit=True,
+            connection_timeout=15
         )
         if DB_SSL_CA_PATH:
             connect_kwargs['ssl_ca'] = DB_SSL_CA_PATH
             connect_kwargs['ssl_verify_cert'] = True
         connection = mysql.connector.connect(**connect_kwargs)
+        LAST_DB_ERROR = None
         return connection
     except Error as e:
+        LAST_DB_ERROR = str(e)
         print(f"❌ Database connection error: {e}")
         return None
+
 
 def query_db(sql, params=None, fetch=True):
     """Execute a query and return results"""
     conn = get_db_connection()
     if not conn:
         return None
+    cursor = None
     try:
         cursor = conn.cursor(dictionary=True)
         cursor.execute(sql, params or ())
@@ -108,9 +134,11 @@ def query_db(sql, params=None, fetch=True):
         traceback.print_exc()
         return None
     finally:
-        if conn and conn.is_connected():
+        if cursor:
             cursor.close()
+        if conn and conn.is_connected():
             conn.close()
+
 
 # ========== JWT AUTH ==========
 def generate_token(user_id, email):
@@ -122,6 +150,7 @@ def generate_token(user_id, email):
         'iat': datetime.utcnow()
     }
     return jwt.encode(payload, JWT_SECRET, algorithm='HS256')
+
 
 def require_auth(f):
     """Decorator to require a valid JWT token"""
@@ -148,8 +177,6 @@ def require_auth(f):
     return decorated
 
 
-# ========== HAZARD DETECTION ==========
-# Map each model's class names -> (hazard_level, road_status)
 # ========== ROUTES ==========
 
 @app.route('/')
@@ -157,10 +184,10 @@ def home():
     return jsonify({
         "message": "SafeSense Backend is running!",
         "status": "OK",
-        "version": "1.0.0",
-        "yolo_available": YOLO_AVAILABLE,
-        "teachable_machine_available": TM_AVAILABLE
+        "version": "1.0.1",
+        "firebase_ready": firestore_client is not None
     })
+
 
 @app.route('/test-db')
 def test_db():
@@ -176,8 +203,14 @@ def test_db():
         return jsonify({
             "message": "Failed to connect to database",
             "status": "ERROR",
-            "help": "Make sure MySQL is running and .env has correct credentials"
+            "error": LAST_DB_ERROR,
+            "host": DB_HOST,
+            "port": DB_PORT,
+            "user": DB_USER,
+            "database": DB_NAME,
+            "ssl_ca_loaded": DB_SSL_CA_PATH is not None
         }), 500
+
 
 # ========== USER AUTHENTICATION ==========
 
@@ -192,7 +225,6 @@ def login():
         if not email or not password:
             return jsonify({"error": "Email and password required"}), 400
 
-        # Fetch user by email only
         user = query_db(
             "SELECT user_id, email, name, password_hash FROM user WHERE email = %s",
             (email,)
@@ -201,21 +233,18 @@ def login():
         if not user:
             return jsonify({"error": "Invalid credentials"}), 401
 
-        # Verify password — handle both plaintext (legacy) and bcrypt hashes
         stored_hash = user[0]['password_hash']
         is_bcrypt = isinstance(stored_hash, str) and stored_hash.startswith('$2')
 
         if is_bcrypt:
-            # Normal bcrypt verification
             if isinstance(stored_hash, str):
                 stored_hash = stored_hash.encode('utf-8')
             if not bcrypt.checkpw(password.encode('utf-8'), stored_hash):
                 return jsonify({"error": "Invalid credentials"}), 401
         else:
-            # Legacy plaintext password — compare directly
+            # Legacy plaintext password
             if stored_hash != password:
                 return jsonify({"error": "Invalid credentials"}), 401
-            # Auto-upgrade: hash the plaintext password and save it
             new_hash = bcrypt.hashpw(
                 password.encode('utf-8'),
                 bcrypt.gensalt()
@@ -227,7 +256,6 @@ def login():
             )
             print(f"✓ Auto-hashed password for user {user[0]['email']}")
 
-        # Generate JWT token
         token = generate_token(user[0]['user_id'], user[0]['email'])
 
         return jsonify({
@@ -242,6 +270,7 @@ def login():
     except Exception as e:
         print(f"Login error: {e}")
         return jsonify({"error": str(e)}), 500
+
 
 @app.route('/api/auth/register', methods=['POST'])
 def register():
@@ -259,7 +288,6 @@ def register():
         if len(password) < 6:
             return jsonify({"error": "Password must be at least 6 characters"}), 400
 
-        # Check if email already exists
         existing = query_db(
             "SELECT user_id FROM user WHERE email = %s",
             (email,)
@@ -267,7 +295,6 @@ def register():
         if existing:
             return jsonify({"error": "Email already registered"}), 409
 
-        # Hash password with bcrypt
         password_hash = bcrypt.hashpw(
             password.encode('utf-8'),
             bcrypt.gensalt()
@@ -287,31 +314,30 @@ def register():
         print(f"Register error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ========== HAZARD REPORTS ==========
+
+# ========== FIREBASE -> MYSQL SYNC ==========
 
 @app.route('/api/sync-all-users', methods=['GET', 'POST'])
 def sync_all_users():
     """
     Pulls EVERY user from the Firestore `users` collection and upserts them
-    into a MySQL `firebase_users` table. No Flutter changes needed — just
-    hit this URL yourself (browser, Postman, or a scheduled ping) whenever
-    you want the MySQL table refreshed with the latest Firebase users.
+    into a MySQL `firebase_users` table.
 
-    Protected by a simple shared-secret query param so randoms on the
-    internet can't trigger it: /api/sync-all-users?key=YOUR_SECRET
-    Set ADMIN_SYNC_KEY in your environment to whatever you want that secret
-    to be.
+    Protected by a shared secret: /api/sync-all-users?key=YOUR_SECRET
+    Set ADMIN_SYNC_KEY in Render's environment.
     """
     if firestore_client is None:
         return jsonify({'error': 'Firebase Admin not configured on server'}), 500
 
-    expected_key = os.getenv('ADMIN_SYNC_KEY', '')
-    if expected_key and request.args.get('key', '') != expected_key:
+    expected_key = os.getenv('ADMIN_SYNC_KEY', '').strip()
+    if not expected_key:
+        return jsonify({'error': 'ADMIN_SYNC_KEY is not set on the server'}), 500
+    if request.args.get('key', '') != expected_key:
         return jsonify({'error': 'Missing or wrong ?key= parameter'}), 401
 
     conn = get_db_connection()
     if not conn:
-        return jsonify({'error': 'Database connection failed'}), 500
+        return jsonify({'error': 'Database connection failed', 'detail': LAST_DB_ERROR}), 500
 
     synced = []
     try:
@@ -328,7 +354,6 @@ def sync_all_users():
             )
         """)
 
-        # Pull every doc in the users collection, straight from Firestore.
         for doc in firestore_client.collection('users').stream():
             uid = doc.id
             profile = doc.to_dict() or {}
@@ -338,7 +363,10 @@ def sync_all_users():
             phone = profile.get('phone', '')
             role = profile.get('role', 'user')
             created_at = profile.get('createdAt')
-            created_at_sql = created_at.isoformat() if hasattr(created_at, 'isoformat') else None
+            created_at_sql = (
+                created_at.strftime('%Y-%m-%d %H:%M:%S')
+                if hasattr(created_at, 'strftime') else None
+            )
 
             cursor.execute("""
                 INSERT INTO firebase_users (firebase_uid, name, email, phone, role, created_at, last_synced_at)
@@ -356,29 +384,28 @@ def sync_all_users():
         cursor.close()
     except Error as e:
         return jsonify({'error': f'Database error: {e}'}), 500
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': f'Sync failed: {e}'}), 500
     finally:
         conn.close()
 
     return jsonify({'synced_count': len(synced), 'users': synced}), 200
 
 
+# ========== AI ANALYSIS ==========
+
 @app.route('/api/ai/analyze', methods=['POST'])
 def analyze_only():
     """
-    Runs the same detection pipeline as /api/reports/upload but does NOT
-    touch MySQL — it just returns the analysis JSON. Added for the
-    Firestore migration: Flutter now uploads the image to Firebase Storage
-    itself, calls this endpoint for the AI result, and writes the report
-    document to Firestore directly. See AI_SETUP.md.
-
-    NOT auth-gated by @require_auth (unlike the old /api/reports/upload)
-    since Firebase Authentication — not this Flask app — now owns identity;
-    this endpoint has no user-specific data to protect. If you want to
-    restrict who can call it (e.g. rate-limiting, cost control), verify a
-    Firebase ID token here with the Admin SDK rather than re-adding the old
-    Flask JWT check, which Flutter no longer produces.
+    Runs the detection pipeline and returns the analysis JSON without
+    touching MySQL. Flutter uploads the image to Firebase Storage itself,
+    calls this for the AI result, and writes the report to Firestore.
     """
     try:
+        # Lazy import: models load on first call, not at server startup.
+        from ai_inference import analyze_damage_with_yolo
+
         if 'image' not in request.files:
             return jsonify({"error": "No image provided"}), 400
 
@@ -401,53 +428,40 @@ def analyze_only():
         return jsonify({"error": str(e)}), 500
 
 
+# ========== HAZARD REPORTS (legacy MySQL path) ==========
+
 @app.route('/api/reports/upload', methods=['POST'])
 @require_auth
 def upload_report():
     """
-    DEPRECATED as of the Firestore migration stage — kept only so the old
-    Flask/MySQL path still works if you haven't switched Flutter's build
-    over yet. New code should not call this; use /api/ai/analyze plus a
-    Firestore write from the client instead. Also: @require_auth here still
-    checks the old Flask-issued JWT, which nothing in the app generates
-    anymore, so this route is effectively unreachable from the current
-    Flutter build regardless.
-
-    Upload an image, analyze with the Teachable Machine classifier and
-    YOLOv8 models, store report in database.
-    Inserts into: uploaded_image + detection_result (+ optionally disaster).
+    DEPRECATED — kept for the old Flask/MySQL path. New code should use
+    /api/ai/analyze plus a Firestore write from the client.
     """
     try:
-        print("🔵 [1] Route entered")
+        from ai_inference import analyze_damage_with_yolo
 
         if 'image' not in request.files:
             return jsonify({"error": "No image provided"}), 400
-        print("🔵 [2] Image found in request")
 
         file = request.files['image']
         latitude = float(request.form.get('latitude', 19.2456))
         longitude = float(request.form.get('longitude', 73.1300))
         user_id = request.user_id
-        print(f"🔵 [3] Parsed form data: lat={latitude}, lng={longitude}, user_id={user_id}")
 
         with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
             file.save(tmp.name)
             image_path = tmp.name
-        print(f"🔵 [4] Saved temp file at {image_path}")
 
         analysis = analyze_damage_with_yolo(image_path)
-        print(f"🔵 [5] Analysis complete: {analysis}")
 
         user_description = request.form.get('description', '')
         description = user_description if user_description else f"Auto-detected: {analysis['damage_type']} - {analysis['road_status']}"
-        print("🔵 [6] Description built, starting DB transaction")
 
         conn = get_db_connection()
         if not conn:
-            print("🔴 [ERROR] DB connection failed")
             return jsonify({"error": "Database connection failed"}), 500
-        print("🔵 [7] DB connected")
 
+        cursor = None
         try:
             cursor = conn.cursor(dictionary=True)
 
@@ -459,7 +473,6 @@ def upload_report():
                 (analysis['damage_type'], analysis['hazard_level'], description),
             )
             disaster_id = cursor.lastrowid
-            print(f"🔵 [8] Disaster inserted, id={disaster_id}")
 
             cursor.execute(
                 """
@@ -469,7 +482,6 @@ def upload_report():
                 (user_id, disaster_id, image_path, latitude, longitude),
             )
             image_id = cursor.lastrowid
-            print(f"🔵 [9] Image row inserted, id={image_id}")
 
             cursor.execute(
                 """
@@ -479,10 +491,8 @@ def upload_report():
                 (image_id, analysis['damage_type'], analysis['hazard_level'],
                  analysis['confidence'], analysis['road_status']),
             )
-            print("🔵 [10] Detection result inserted")
 
             conn.commit()
-            print("🔵 [11] Transaction committed")
             img_result = 1
         except Error as e:
             conn.rollback()
@@ -490,12 +500,11 @@ def upload_report():
             traceback.print_exc()
             img_result = None
         finally:
-            cursor.close()
+            if cursor:
+                cursor.close()
             conn.close()
 
-        print("🔵 [12] About to return response")
-
-        if img_result and img_result > 0:
+        if img_result:
             return jsonify({
                 "status": "success",
                 "message": "Report submitted and analyzed",
@@ -509,6 +518,7 @@ def upload_report():
         print(f"🔴 [FATAL] Unhandled exception: {e}")
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
 
 @app.route('/api/reports/hazards', methods=['GET'])
 def get_hazards():
@@ -533,6 +543,7 @@ def get_hazards():
     except Exception as e:
         print(f"Get hazards error: {e}")
         return jsonify({"error": str(e)}), 500
+
 
 @app.route('/api/reports/user/<int:user_id>', methods=['GET'])
 @require_auth
@@ -559,106 +570,11 @@ def get_user_reports(user_id):
         print(f"Get user reports error: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/reports/nearby', methods=['GET'])
-def get_nearby_hazards():
-    """Get hazards near a location (for dashboard)"""
-    try:
-        lat = float(request.args.get('lat', 19.2456))
-        lng = float(request.args.get('lng', 73.1300))
-        radius_km = float(request.args.get('radius', 5))
 
-        hazards = query_db(
-            """
-            SELECT dr.detection_id AS id, dr.damage_type, dr.severity AS hazard_level,
-                   dr.confidence, dr.road_status, ui.latitude, ui.longitude, dr.detected_at AS created_at,
-                   (6371 * acos(cos(radians(%s)) * cos(radians(ui.latitude)) * cos(radians(ui.longitude) - radians(%s)) + sin(radians(%s)) * sin(radians(ui.latitude)))) AS distance
-            FROM detection_result dr
-            JOIN uploaded_image ui ON dr.image_id = ui.image_id
-            WHERE ui.status = 'approved'
-            HAVING distance < %s
-            ORDER BY distance ASC
-            LIMIT 20
-            """,
-            (lat, lng, lat, radius_km)
-        )
+# ---- If your original app.py had more routes AFTER get_user_reports,
+# ---- paste them here (your upload was cut off at that point). ----
 
-        return jsonify({
-            "status": "success",
-            "nearby_hazards": hazards or []
-        }), 200
-    except Exception as e:
-        print(f"Get nearby hazards error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# ========== SHELTERS & ROUTE PLANNING ==========
-
-@app.route('/api/shelters', methods=['GET'])
-def get_shelters():
-    """Get all shelters for rescue guidance"""
-    try:
-        shelters = query_db(
-            "SELECT shelter_id AS id, name, latitude, longitude, capacity, occupancy AS current_occupancy, contact AS phone, status FROM shelter"
-        )
-
-        return jsonify({
-            "status": "success",
-            "shelters": shelters or []
-        }), 200
-    except Exception as e:
-        print(f"Get shelters error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/shelters/nearest', methods=['GET'])
-def get_nearest_shelter():
-    """Find nearest safe shelter from a location"""
-    try:
-        lat = float(request.args.get('lat', 19.2456))
-        lng = float(request.args.get('lng', 73.1300))
-
-        shelter = query_db(
-            """
-            SELECT shelter_id AS id, name, latitude, longitude, capacity,
-                   occupancy AS current_occupancy, contact AS phone, status,
-                   (6371 * acos(cos(radians(%s)) * cos(radians(latitude)) * cos(radians(longitude) - radians(%s)) + sin(radians(%s)) * sin(radians(latitude)))) AS distance_km
-            FROM shelter
-            WHERE status = 'available'
-            ORDER BY distance_km ASC
-            LIMIT 1
-            """,
-            (lat, lng, lat)
-        )
-
-        if shelter:
-            return jsonify({
-                "status": "success",
-                "nearest_shelter": shelter[0]
-            }), 200
-        else:
-            return jsonify({"error": "No shelters found"}), 404
-    except Exception as e:
-        print(f"Get nearest shelter error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# ========== ERROR HANDLER ==========
-
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({"error": "Endpoint not found"}), 404
-
-@app.errorhandler(500)
-def server_error(error):
-    return jsonify({"error": "Internal server error"}), 500
-
-# ========== RUN ==========
 
 if __name__ == '__main__':
-    print("=" * 60)
-    print("SafeSense Backend Starting...")
-    print("=" * 60)
-    print(f"✓ Database: {DB_HOST} / {DB_NAME} (user: {DB_USER}, pass: {'***' if DB_PASSWORD else '(empty)'})")
-    print(f"✓ YOLOv8: {'Available' if YOLO_AVAILABLE else 'Not installed (optional)'}")
-    print(f"✓ Teachable Machine: {'Available' if TM_AVAILABLE else 'Not installed (optional)'}")
-    print(f"✓ JWT Auth: Enabled (token expires in {JWT_EXPIRY_HOURS}h)")
-    print("✓ Running on http://0.0.0.0:5000")
-    print("=" * 60)
-    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True, use_reloader=False)
+    port = int(os.getenv('PORT', '5000'))
+    app.run(host='0.0.0.0', port=port)
